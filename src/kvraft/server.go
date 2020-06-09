@@ -2,6 +2,7 @@ package kvraft
 
 import (
 	"../labgob"
+    "fmt"
 	"../labrpc"
 	"log"
 	"../raft"
@@ -23,6 +24,8 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+    Op string
+    
 }
 
 type KVServer struct {
@@ -35,15 +38,153 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+    data        map[string]string
+    notify      map[int]chan struct{}
+    latestReplies map[int64]*LatestReply
+    //3B
+    appliedRaftLogIndex int
 }
 
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	// Your code here.
+    index, term, Leader := kv.rf.Start(args.Op)
+    if !Leader{
+        reply.IsLeader=false
+        return
+    }
+    
+    //some code avoid repeated requests
+    kv.mu.Lock()
+    if latestReply, ok := kv.latestReplies[args.Cid]; ok && args.Seq<= latestReply.Seq{
+        reply.Value = latestReply.Value
+        reply.IsLeader=true
+        kv.mu.Unlock()
+        return
+    }
+    kv.mu.Unlock()
+    //
+    command := Op{Operation:"Get", Key:args.Key, Cid:args.Cid, Seq:args.Seq}
+    index, term, _ := kv.rf.Start(command)
+    
+    kv.mu.Lock()
+    ch := make(chan NotifyMsg, 1)
+    kv.notify[index] = ch
+    kv.mu.Unlock()
+    
+    select {
+        case <-ch:
+            curTerm, isLeader := kv.rf.GetState()
+            if curTerm!=term || !isLeader{
+                reply.IsLeader=false
+            }else {
+                kv.mu.Lock()
+                if value, ok := kv.db[args.Key]; ok {
+                    reply.Value = value
+                }
+                kv.mu.Unlock()
+                reply.IsLeader=true
+            }
+    }
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+    index, term, Leader := kv.rf.Start(args.Op)
+    if !Leader{
+        reply.IsLeader=false
+        return
+    }
+    //some code avoid repeated requests
+    kv.mu.Lock()
+    if latestReply, ok := kv.latestReplies[args.Cid]; ok && args.Seq<= latestReply.Seq{
+        reply.IsLeader=true
+        kv.mu.Unlock()
+        return
+    }
+    kv.mu.Unlock()
+    //
+    command := Op{Operation:"PutAppend", Key:args.Key, Cid:args.Cid, Seq:args.Seq}
+	index, term, _ := kv.rf.Start(command)
+    
+    kv.mu.Lock()
+    ch := make(chan NotifyMsg, 1)
+    kv.notify[index] = ch
+    kv.mu.Unlock()
+    
+    select {
+        case <-ch:
+            curTerm, isLeader := kv.rf.GetState()
+            if curTerm!=term || !isLeader{
+                reply.IsLeader=false
+            }else {
+                kv.mu.Lock()
+                kv.data[args.Key]=args.Value
+                kv.mu.Unlock()
+                reply.IsLeader=true
+            }
+    }
+    
+}
+func (kv *KVServer) applyDaemon()  {
+    for appliedEntry := range kv.applyCh {
+        command := appliedEntry.Command.(Op)
+        kv.mu.Lock()
+        if latestReply, ok := kv.latestReplies[command.Cid]; !ok || command.Seq > latestReply.Seq {
+            switch command.Operation {
+                case "Get":
+                    latestReply := LatestReply{Seq:command.Seq,}
+                    var reply GetReply
+                    if value, ok := kv.data[command.Key]; ok {
+                        reply.Value = value
+                    } else {
+                        reply.Err = ErrNoKey
+                    }
+                    latestReply.Reply = reply
+                    kv.latestReplies[command.Cid] = &latestReply
+                case "Put":
+                    kv.db[command.Key] = command.Value
+                    latestReply := LatestReply{Seq:command.Seq}
+                    kv.latestReplies[command.Cid] = &latestReply
+                case "Append":
+                    kv.db[command.Key] += command.Value
+                    latestReply := LatestReply{Seq:command.Seq}
+                    kv.latestReplies[command.Cid] = &latestReply
+                default:
+                    panic("invalid command operation")
+        }
+        DPrintf("%d applied index:%d, cmd:%v\n", kv.me, appliedEntry.CommandIndex, command)
+        if ch, ok := kv.notify[appliedEntry.CommandIndex]; ok && ch != nil {
+            DPrintf("%d notify index %d\n",kv.me, appliedEntry.CommandIndex)
+			close(ch)
+			delete(kv.notify, appliedEntry.CommandIndex)
+        }
+        kv.mu.Unlock()
+    }
+}
+//
+func (kv *KVServer) shouldTakeSnapshot() bool {
+	if kv.maxraftstate == -1 {
+		return false
+	}
+ 
+	if kv.rf.GetRaftStateSize() >= kv.maxraftstate {
+		return true
+	}
+ 
+	return false
+}
+
+func (kv *KVServer) takeSnapshot() {
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	kv.mu.Lock()
+	e.Encode(kv.db)
+	e.Encode(kv.latestReplies)
+	appliedRaftLogIndex := kv.appliedRaftLogIndex
+	kv.mu.Unlock()
+ 
+	kv.rf.ReplaceLogWithSnapshot(appliedRaftLogIndex, w.Bytes())
 }
 
 //
@@ -96,6 +237,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-
+    applyDaemon()
+    
 	return kv
 }
